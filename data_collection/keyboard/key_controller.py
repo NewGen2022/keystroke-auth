@@ -2,8 +2,7 @@ import os
 import time
 import ctypes
 from ctypes import wintypes
-import uuid
-import uiautomation as auto
+import unicodedata
 
 from models.key_model import Key
 
@@ -234,6 +233,97 @@ class KeyController:
             kernel32.CloseHandle(hproc)
 
     @staticmethod
+    def map_scancode_to_char(scan_code: int) -> str:
+        """
+        Convert a raw hardware scan code into the actual character
+        currently produced by this key in the active (foreground) keyboard layout.
+
+        Returns an empty string for control keys or when no printable symbol can be derived.
+
+        Args:
+            scan_code (int): The hardware scan code of the pressed key.
+
+        Logic:
+            1) Get the HKL (keyboard layout handle) of the foreground thread.
+            2) Convert scan code → virtual-key code using MapVirtualKeyExW().
+               (Fallback to MapVirtualKeyW() if needed.)
+            3) Retrieve the current modifier key state using GetKeyboardState().
+            4) Convert (vk, scan, key_state, layout) → Unicode character via ToUnicodeEx().
+        """
+
+        if not scan_code:
+            raise ValueError("Scan code needed")
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+
+        # Define function signatures for the needed WinAPI functions
+        user32.GetForegroundWindow.restype = wintypes.HWND
+
+        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+
+        user32.GetKeyboardLayout.argtypes = [wintypes.DWORD]
+        user32.GetKeyboardLayout.restype = wintypes.HKL
+
+        user32.MapVirtualKeyExW.argtypes = [wintypes.UINT, wintypes.UINT, wintypes.HKL]
+        user32.MapVirtualKeyExW.restype = wintypes.UINT
+
+        user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
+        user32.MapVirtualKeyW.restype = wintypes.UINT
+
+        user32.GetKeyboardState.argtypes = [ctypes.c_void_p]
+        user32.GetKeyboardState.restype = wintypes.BOOL
+
+        user32.ToUnicodeEx.argtypes = [
+            wintypes.UINT, wintypes.UINT, ctypes.c_void_p,
+            wintypes.LPWSTR, ctypes.c_int, wintypes.UINT, wintypes.HKL
+        ]
+        user32.ToUnicodeEx.restype = ctypes.c_int
+
+        # Mapping modes for MapVirtualKey functions
+        MAPVK_VSC_TO_VK_EX = 3
+        MAPVK_VSC_TO_VK = 1
+
+        # 1) Obtain HKL (keyboard layout handle) for the foreground thread
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            raise ValueError("Unknown or no foreground window")
+        tid = user32.GetWindowThreadProcessId(hwnd, None)
+        hkl = user32.GetKeyboardLayout(tid)
+
+        # 2) Convert scan code to virtual-key code
+        vk = int(user32.MapVirtualKeyExW(scan_code, MAPVK_VSC_TO_VK_EX, hkl) or 0)
+        if vk == 0:
+            vk = int(user32.MapVirtualKeyW(scan_code, MAPVK_VSC_TO_VK) or 0)
+        if not vk:
+            return ""
+
+        # 3) Retrieve the current keyboard state (modifiers like Shift, Ctrl, etc.)
+        key_state = (ctypes.c_byte * 256)()
+        ok = user32.GetKeyboardState(ctypes.byref(key_state))
+        if not ok:
+            raise ValueError("Unknown keyboard state")
+
+        # 4) Convert key codes into a character using the active layout
+        buf = ctypes.create_unicode_buffer(8)
+        res = user32.ToUnicodeEx(
+            wintypes.UINT(vk),
+            wintypes.UINT(scan_code),
+            ctypes.byref(key_state),
+            buf,
+            ctypes.c_int(len(buf)),
+            wintypes.UINT(0),
+            hkl
+        )
+
+        # res > 0 → buffer contains characters
+        # res == 0 → control key (no output)
+        # res < 0 → dead key (accent waiting for next letter)
+        if res > 0:
+            return buf.value
+        return ""
+
+    @staticmethod
     def build_key(key):
         """
         Capture and convert a low-level keyboard event into a structured `Key` object.
@@ -268,16 +358,18 @@ class KeyController:
             Key: Immutable dataclass instance representing a single key event.
         """
 
-        session_id = uuid.uuid4().hex  # Unique session identifier (grouping key events)
-        key_name = key.name  # Logical key name (symbolic form)
+        scan_code = key.scan_code  # Hardware scan code (physical key position)
+
+        key_name = KeyController.map_scancode_to_char(scan_code).strip()  # Logical key name (symbolic form)
+        if (not key_name) or (len(key_name) == 1 and unicodedata.category(key_name) == "Cc"):
+            key_name = key.name
+
         event = key.event_type  # Type of event: "DOWN" or "UP"
         timestamp = time.time_ns()  # Nanoseconds since Unix epoch (high precision)
-        scan_code = key.scan_code  # Hardware scan code (physical key position)
         keyboard_layout = KeyController.get_language()
         active_window = KeyController.get_process_name()
 
         return Key(
-            str(session_id),
             key_name,
             event,
             timestamp,

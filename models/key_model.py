@@ -44,7 +44,6 @@ class Key:
         slots=True — saves memory and speeds up attribute access
             by creating a fixed set of fields instead of a dynamic dictionary.
     """
-    session_id: str
     key_name: str
     event: EventType
     timestamp: int
